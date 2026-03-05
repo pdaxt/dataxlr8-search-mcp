@@ -4,7 +4,16 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info, warn};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const DEFAULT_LIMIT: i64 = 50;
+const DEFAULT_OFFSET: i64 = 0;
+const MAX_LIMIT: i64 = 200;
+const MAX_QUERY_LEN: usize = 500;
 
 // ============================================================================
 // Data types
@@ -40,6 +49,8 @@ pub struct SearchResult {
 pub struct SearchResponse {
     pub query: String,
     pub total: usize,
+    pub limit: i64,
+    pub offset: i64,
     pub results: Vec<SearchResult>,
 }
 
@@ -87,6 +98,26 @@ fn empty_schema() -> Arc<serde_json::Map<String, serde_json::Value>> {
     Arc::new(m)
 }
 
+fn pagination_props() -> serde_json::Value {
+    serde_json::json!({
+        "limit": { "type": "integer", "description": "Max results (default 50, max 200)" },
+        "offset": { "type": "integer", "description": "Offset for pagination (default 0)" }
+    })
+}
+
+/// Merge pagination properties into an existing properties object
+fn with_pagination(mut props: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = props.as_object_mut() {
+        let pag = pagination_props();
+        if let Some(pag_obj) = pag.as_object() {
+            for (k, v) in pag_obj {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    props
+}
+
 fn build_tools() -> Vec<Tool> {
     vec![
         Tool {
@@ -97,10 +128,9 @@ fn build_tools() -> Vec<Tool> {
                     .into(),
             ),
             input_schema: make_schema(
-                serde_json::json!({
-                    "query": { "type": "string", "description": "Search keyword" },
-                    "limit": { "type": "integer", "description": "Max results per source (default 10)" }
-                }),
+                with_pagination(serde_json::json!({
+                    "query": { "type": "string", "description": "Search keyword (required, max 500 chars)" }
+                })),
                 vec!["query"],
             ),
             output_schema: None,
@@ -116,14 +146,13 @@ fn build_tools() -> Vec<Tool> {
                 "Dedicated contact search with advanced filters: company, tags, date range".into(),
             ),
             input_schema: make_schema(
-                serde_json::json!({
+                with_pagination(serde_json::json!({
                     "query": { "type": "string", "description": "Search term for name, email, company" },
                     "company": { "type": "string", "description": "Filter by company name" },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter by tags (AND)" },
                     "date_from": { "type": "string", "description": "Created after (ISO 8601)" },
-                    "date_to": { "type": "string", "description": "Created before (ISO 8601)" },
-                    "limit": { "type": "integer", "description": "Max results (default 20)" }
-                }),
+                    "date_to": { "type": "string", "description": "Created before (ISO 8601)" }
+                })),
                 vec![],
             ),
             output_schema: None,
@@ -139,13 +168,12 @@ fn build_tools() -> Vec<Tool> {
                 "Search deals by title, stage, or value range".into(),
             ),
             input_schema: make_schema(
-                serde_json::json!({
+                with_pagination(serde_json::json!({
                     "query": { "type": "string", "description": "Search term for deal title or company" },
                     "stage": { "type": "string", "description": "Filter by deal stage" },
                     "value_min": { "type": "number", "description": "Minimum deal value" },
-                    "value_max": { "type": "number", "description": "Maximum deal value" },
-                    "limit": { "type": "integer", "description": "Max results (default 20)" }
-                }),
+                    "value_max": { "type": "number", "description": "Maximum deal value" }
+                })),
                 vec![],
             ),
             output_schema: None,
@@ -161,13 +189,12 @@ fn build_tools() -> Vec<Tool> {
                 "Search sent emails by recipient, subject, or status".into(),
             ),
             input_schema: make_schema(
-                serde_json::json!({
+                with_pagination(serde_json::json!({
                     "query": { "type": "string", "description": "Search term for recipient or subject" },
                     "status": { "type": "string", "description": "Filter by email status (sent, delivered, bounced)" },
                     "date_from": { "type": "string", "description": "Sent after (ISO 8601)" },
-                    "date_to": { "type": "string", "description": "Sent before (ISO 8601)" },
-                    "limit": { "type": "integer", "description": "Max results (default 20)" }
-                }),
+                    "date_to": { "type": "string", "description": "Sent before (ISO 8601)" }
+                })),
                 vec![],
             ),
             output_schema: None,
@@ -183,11 +210,10 @@ fn build_tools() -> Vec<Tool> {
                 "Full-text search on notes with optional tag filter".into(),
             ),
             input_schema: make_schema(
-                serde_json::json!({
-                    "query": { "type": "string", "description": "Full-text search term" },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter by tags" },
-                    "limit": { "type": "integer", "description": "Max results (default 20)" }
-                }),
+                with_pagination(serde_json::json!({
+                    "query": { "type": "string", "description": "Full-text search term (required, max 500 chars)" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter by tags" }
+                })),
                 vec!["query"],
             ),
             output_schema: None,
@@ -203,9 +229,7 @@ fn build_tools() -> Vec<Tool> {
                 "Show most recent items across all schemas (contacts, deals, emails, notes)".into(),
             ),
             input_schema: make_schema(
-                serde_json::json!({
-                    "limit": { "type": "integer", "description": "Max results per source (default 5)" }
-                }),
+                with_pagination(serde_json::json!({})),
                 vec![],
             ),
             output_schema: None,
@@ -222,11 +246,12 @@ fn build_tools() -> Vec<Tool> {
             ),
             input_schema: make_schema(
                 serde_json::json!({
-                    "action": { "type": "string", "enum": ["save", "list", "run", "delete"], "description": "Action to perform" },
+                    "action": { "type": "string", "enum": ["save", "list", "run", "delete"], "description": "Action to perform (required)" },
                     "name": { "type": "string", "description": "Name for the saved search" },
                     "query_type": { "type": "string", "enum": ["all", "contacts", "deals", "emails", "notes"], "description": "Type of search (required for save)" },
                     "query_params": { "type": "object", "description": "Search parameters to save (required for save)" },
-                    "limit": { "type": "integer", "description": "Max results when running (default 20)" }
+                    "limit": { "type": "integer", "description": "Max results when running (default 50, max 200)" },
+                    "offset": { "type": "integer", "description": "Offset for pagination (default 0)" }
                 }),
                 vec!["action"],
             ),
@@ -243,9 +268,7 @@ fn build_tools() -> Vec<Tool> {
                 "Most searched terms, result counts, and search frequency".into(),
             ),
             input_schema: make_schema(
-                serde_json::json!({
-                    "limit": { "type": "integer", "description": "Number of top queries to return (default 20)" }
-                }),
+                with_pagination(serde_json::json!({})),
                 vec![],
             ),
             output_schema: None,
@@ -274,9 +297,12 @@ impl SearchMcpServer {
     fn json_result<T: Serialize>(data: &T) -> CallToolResult {
         match serde_json::to_string_pretty(data) {
             Ok(json) => CallToolResult::success(vec![Content::text(json)]),
-            Err(e) => CallToolResult::error(vec![Content::text(format!(
-                "Serialization error: {e}"
-            ))]),
+            Err(e) => {
+                error!(error = %e, "Failed to serialize result");
+                CallToolResult::error(vec![Content::text(format!(
+                    "Serialization error: {e}"
+                ))])
+            }
         }
     }
 
@@ -285,7 +311,10 @@ impl SearchMcpServer {
     }
 
     fn get_str(args: &serde_json::Value, key: &str) -> Option<String> {
-        args.get(key).and_then(|v| v.as_str()).map(String::from)
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     fn get_i64(args: &serde_json::Value, key: &str) -> Option<i64> {
@@ -301,41 +330,95 @@ impl SearchMcpServer {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
                     .collect()
             })
             .unwrap_or_default()
     }
 
+    /// Clamp limit to [1, MAX_LIMIT] with a given default
+    fn clamp_limit(args: &serde_json::Value, default: i64) -> i64 {
+        Self::get_i64(args, "limit")
+            .unwrap_or(default)
+            .clamp(1, MAX_LIMIT)
+    }
+
+    /// Get offset, ensuring it is non-negative
+    fn clamp_offset(args: &serde_json::Value) -> i64 {
+        Self::get_i64(args, "offset")
+            .unwrap_or(DEFAULT_OFFSET)
+            .max(0)
+    }
+
+    /// Validate a query string: non-empty after trim, within max length
+    fn validate_query(query: &str) -> Result<(), String> {
+        if query.is_empty() {
+            return Err("Query parameter cannot be empty".to_string());
+        }
+        if query.len() > MAX_QUERY_LEN {
+            return Err(format!(
+                "Query too long ({} chars). Maximum is {} chars",
+                query.len(),
+                MAX_QUERY_LEN
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate an ISO 8601 date string
+    fn validate_date(date_str: &str, field_name: &str) -> Result<(), String> {
+        if chrono::DateTime::parse_from_rfc3339(date_str).is_err()
+            && chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").is_err()
+        {
+            return Err(format!(
+                "Invalid date format for '{field_name}': '{date_str}'. Expected ISO 8601 (e.g. 2025-01-15 or 2025-01-15T00:00:00Z)"
+            ));
+        }
+        Ok(())
+    }
+
     async fn log_search(&self, query: &str, result_count: i32) {
         let id = uuid::Uuid::new_v4().to_string();
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO search.search_log (id, query, result_count) VALUES ($1, $2, $3)",
         )
         .bind(&id)
         .bind(query)
         .bind(result_count)
         .execute(self.db.pool())
-        .await;
+        .await
+        {
+            warn!(error = %e, query = query, "Failed to log search");
+        }
     }
 
     /// Check if a schema and table exist before querying
     async fn table_exists(&self, schema: &str, table: &str) -> bool {
-        let result: Option<(bool,)> = sqlx::query_as(
+        match sqlx::query_as::<_, (bool,)>(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)",
         )
         .bind(schema)
         .bind(table)
         .fetch_optional(self.db.pool())
         .await
-        .ok()
-        .flatten();
-        result.map(|r| r.0).unwrap_or(false)
+        {
+            Ok(Some(row)) => row.0,
+            Ok(None) => false,
+            Err(e) => {
+                error!(error = %e, schema = schema, table = table, "Failed to check table existence");
+                false
+            }
+        }
     }
 
     // ---- Tool handlers ----
 
-    async fn handle_search_all(&self, query: &str, limit: i64) -> CallToolResult {
+    async fn handle_search_all(&self, query: &str, limit: i64, offset: i64) -> CallToolResult {
+        if let Err(msg) = Self::validate_query(query) {
+            return Self::error_result(&msg);
+        }
+
         let pattern = format!("%{query}%");
         let mut results: Vec<SearchResult> = Vec::new();
 
@@ -351,7 +434,7 @@ impl SearchMcpServer {
                 updated_at: chrono::DateTime<chrono::Utc>,
             }
 
-            if let Ok(rows) = sqlx::query_as::<_, Row>(
+            match sqlx::query_as::<_, Row>(
                 "SELECT id, first_name, last_name, company, email, updated_at \
                  FROM contacts.contacts \
                  WHERE first_name ILIKE $1 OR last_name ILIKE $1 OR company ILIKE $1 OR email ILIKE $1 \
@@ -362,14 +445,19 @@ impl SearchMcpServer {
             .fetch_all(self.db.pool())
             .await
             {
-                for r in rows {
-                    results.push(SearchResult {
-                        source: "contacts".into(),
-                        id: r.id,
-                        title: format!("{} {}", r.first_name, r.last_name),
-                        snippet: r.company.or(r.email).unwrap_or_default(),
-                        updated_at: r.updated_at,
-                    });
+                Ok(rows) => {
+                    for r in rows {
+                        results.push(SearchResult {
+                            source: "contacts".into(),
+                            id: r.id,
+                            title: format!("{} {}", r.first_name, r.last_name),
+                            snippet: r.company.or(r.email).unwrap_or_default(),
+                            updated_at: r.updated_at,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to search contacts");
                 }
             }
         }
@@ -385,7 +473,7 @@ impl SearchMcpServer {
                 updated_at: chrono::DateTime<chrono::Utc>,
             }
 
-            if let Ok(rows) = sqlx::query_as::<_, Row>(
+            match sqlx::query_as::<_, Row>(
                 "SELECT id, title, stage, value::float8 as value, updated_at \
                  FROM deals.deals \
                  WHERE title ILIKE $1 OR company ILIKE $1 \
@@ -396,20 +484,25 @@ impl SearchMcpServer {
             .fetch_all(self.db.pool())
             .await
             {
-                for r in rows {
-                    let snippet = match (r.stage.as_deref(), r.value) {
-                        (Some(s), Some(v)) => format!("{s} — ${v:.0}"),
-                        (Some(s), None) => s.to_string(),
-                        (None, Some(v)) => format!("${v:.0}"),
-                        _ => String::new(),
-                    };
-                    results.push(SearchResult {
-                        source: "deals".into(),
-                        id: r.id,
-                        title: r.title,
-                        snippet,
-                        updated_at: r.updated_at,
-                    });
+                Ok(rows) => {
+                    for r in rows {
+                        let snippet = match (r.stage.as_deref(), r.value) {
+                            (Some(s), Some(v)) => format!("{s} — ${v:.0}"),
+                            (Some(s), None) => s.to_string(),
+                            (None, Some(v)) => format!("${v:.0}"),
+                            _ => String::new(),
+                        };
+                        results.push(SearchResult {
+                            source: "deals".into(),
+                            id: r.id,
+                            title: r.title,
+                            snippet,
+                            updated_at: r.updated_at,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to search deals");
                 }
             }
         }
@@ -425,7 +518,7 @@ impl SearchMcpServer {
                 created_at: chrono::DateTime<chrono::Utc>,
             }
 
-            if let Ok(rows) = sqlx::query_as::<_, Row>(
+            match sqlx::query_as::<_, Row>(
                 "SELECT id, recipient, subject, status, created_at \
                  FROM email.emails \
                  WHERE recipient ILIKE $1 OR subject ILIKE $1 \
@@ -436,14 +529,19 @@ impl SearchMcpServer {
             .fetch_all(self.db.pool())
             .await
             {
-                for r in rows {
-                    results.push(SearchResult {
-                        source: "emails".into(),
-                        id: r.id,
-                        title: r.subject.unwrap_or_else(|| "(no subject)".into()),
-                        snippet: format!("To: {} [{}]", r.recipient, r.status.unwrap_or_default()),
-                        updated_at: r.created_at,
-                    });
+                Ok(rows) => {
+                    for r in rows {
+                        results.push(SearchResult {
+                            source: "emails".into(),
+                            id: r.id,
+                            title: r.subject.unwrap_or_else(|| "(no subject)".into()),
+                            snippet: format!("To: {} [{}]", r.recipient, r.status.unwrap_or_default()),
+                            updated_at: r.created_at,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to search emails");
                 }
             }
         }
@@ -458,7 +556,7 @@ impl SearchMcpServer {
                 created_at: chrono::DateTime<chrono::Utc>,
             }
 
-            if let Ok(rows) = sqlx::query_as::<_, Row>(
+            match sqlx::query_as::<_, Row>(
                 "SELECT id, subject, notes, created_at \
                  FROM contacts.contact_interactions \
                  WHERE (subject ILIKE $1 OR notes ILIKE $1) \
@@ -469,21 +567,26 @@ impl SearchMcpServer {
             .fetch_all(self.db.pool())
             .await
             {
-                for r in rows {
-                    let snippet = r
-                        .notes
-                        .as_deref()
-                        .unwrap_or("")
-                        .chars()
-                        .take(100)
-                        .collect::<String>();
-                    results.push(SearchResult {
-                        source: "notes".into(),
-                        id: r.id,
-                        title: r.subject.unwrap_or_else(|| "(untitled note)".into()),
-                        snippet,
-                        updated_at: r.created_at,
-                    });
+                Ok(rows) => {
+                    for r in rows {
+                        let snippet = r
+                            .notes
+                            .as_deref()
+                            .unwrap_or("")
+                            .chars()
+                            .take(100)
+                            .collect::<String>();
+                        results.push(SearchResult {
+                            source: "notes".into(),
+                            id: r.id,
+                            title: r.subject.unwrap_or_else(|| "(untitled note)".into()),
+                            snippet,
+                            updated_at: r.created_at,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to search notes");
                 }
             }
         }
@@ -492,12 +595,21 @@ impl SearchMcpServer {
         results.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
         let total = results.len();
+
+        // Apply offset to combined results
+        let paginated: Vec<SearchResult> = results
+            .into_iter()
+            .skip(offset as usize)
+            .collect();
+
         self.log_search(query, total as i32).await;
 
         Self::json_result(&SearchResponse {
             query: query.to_string(),
             total,
-            results,
+            limit,
+            offset,
+            results: paginated,
         })
     }
 
@@ -511,7 +623,27 @@ impl SearchMcpServer {
         let tags = Self::get_str_array(args, "tags");
         let date_from = Self::get_str(args, "date_from");
         let date_to = Self::get_str(args, "date_to");
-        let limit = Self::get_i64(args, "limit").unwrap_or(20);
+        let limit = Self::clamp_limit(args, DEFAULT_LIMIT);
+        let offset = Self::clamp_offset(args);
+
+        // Validate query length if provided
+        if let Some(ref q) = query {
+            if let Err(msg) = Self::validate_query(q) {
+                return Self::error_result(&msg);
+            }
+        }
+
+        // Validate date formats
+        if let Some(ref df) = date_from {
+            if let Err(msg) = Self::validate_date(df, "date_from") {
+                return Self::error_result(&msg);
+            }
+        }
+        if let Some(ref dt) = date_to {
+            if let Err(msg) = Self::validate_date(dt, "date_to") {
+                return Self::error_result(&msg);
+            }
+        }
 
         let mut sql = String::from(
             "SELECT id, type, first_name, last_name, company, role, email, phone, \
@@ -557,7 +689,9 @@ impl SearchMcpServer {
         }
 
         sql.push_str(&format!(
-            " ORDER BY updated_at DESC LIMIT ${param_idx}"
+            " ORDER BY updated_at DESC LIMIT ${} OFFSET ${}",
+            param_idx,
+            param_idx + 1,
         ));
 
         #[derive(sqlx::FromRow, Serialize)]
@@ -590,6 +724,7 @@ impl SearchMcpServer {
             q = q.bind(p);
         }
         q = q.bind(limit);
+        q = q.bind(offset);
 
         match q.fetch_all(self.db.pool()).await {
             Ok(contacts) => {
@@ -599,9 +734,17 @@ impl SearchMcpServer {
                     contacts.len() as i32,
                 )
                 .await;
-                Self::json_result(&contacts)
+                Self::json_result(&serde_json::json!({
+                    "results": contacts,
+                    "count": contacts.len(),
+                    "limit": limit,
+                    "offset": offset,
+                }))
             }
-            Err(e) => Self::error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to search contacts");
+                Self::error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
@@ -614,49 +757,31 @@ impl SearchMcpServer {
         let stage = Self::get_str(args, "stage");
         let value_min = Self::get_f64(args, "value_min");
         let value_max = Self::get_f64(args, "value_max");
-        let limit = Self::get_i64(args, "limit").unwrap_or(20);
+        let limit = Self::clamp_limit(args, DEFAULT_LIMIT);
+        let offset = Self::clamp_offset(args);
 
-        let mut sql = String::from(
-            "SELECT id, title, company, stage, value::float8 as value, \
-             contact_id, notes, status, created_at, updated_at \
-             FROM deals.deals WHERE 1=1",
-        );
-        let mut param_idx = 1u32;
-        let mut str_params: Vec<String> = Vec::new();
-        let mut f64_params: Vec<(u32, f64)> = Vec::new();
-
+        // Validate query length if provided
         if let Some(ref q) = query {
-            let p = format!("%{q}%");
-            sql.push_str(&format!(
-                " AND (title ILIKE ${pi} OR company ILIKE ${pi})",
-                pi = param_idx
-            ));
-            param_idx += 1;
-            str_params.push(p);
+            if let Err(msg) = Self::validate_query(q) {
+                return Self::error_result(&msg);
+            }
         }
-        if let Some(ref s) = stage {
-            sql.push_str(&format!(" AND stage = ${param_idx}"));
-            param_idx += 1;
-            str_params.push(s.clone());
+
+        // Validate value range
+        if let (Some(vmin), Some(vmax)) = (value_min, value_max) {
+            if vmin > vmax {
+                return Self::error_result(&format!(
+                    "value_min ({vmin}) cannot be greater than value_max ({vmax})"
+                ));
+            }
         }
         if let Some(vmin) = value_min {
-            sql.push_str(&format!(" AND value >= ${param_idx}"));
-            f64_params.push((param_idx, vmin));
-            param_idx += 1;
-        }
-        if let Some(vmax) = value_max {
-            sql.push_str(&format!(" AND value <= ${param_idx}"));
-            f64_params.push((param_idx, vmax));
-            param_idx += 1;
+            if vmin < 0.0 {
+                return Self::error_result("value_min cannot be negative");
+            }
         }
 
-        sql.push_str(&format!(" ORDER BY updated_at DESC LIMIT ${param_idx}"));
-
-        // We need to bind in order. Build the query string, then bind all in param_idx order.
-        // Since sqlx binds positionally, we need to bind str_params first, then f64_params, then limit.
-        // But f64_params may be interleaved. Let's use a simpler approach with raw SQL and text casting.
-        // Rebuild with all string params approach.
-        let mut sql2 = String::from(
+        let mut sql = String::from(
             "SELECT id, title, company, stage, value::float8 as value, \
              contact_id, notes, status, created_at, updated_at \
              FROM deals.deals WHERE 1=1",
@@ -666,7 +791,7 @@ impl SearchMcpServer {
 
         if let Some(ref q) = query {
             let p = format!("%{q}%");
-            sql2.push_str(&format!(
+            sql.push_str(&format!(
                 " AND (title ILIKE ${pi} OR company ILIKE ${pi})",
                 pi = pidx
             ));
@@ -674,23 +799,28 @@ impl SearchMcpServer {
             all_params.push(p);
         }
         if let Some(ref s) = stage {
-            sql2.push_str(&format!(" AND stage = ${pidx}"));
+            sql.push_str(&format!(" AND stage = ${pidx}"));
             pidx += 1;
             all_params.push(s.clone());
         }
         if let Some(vmin) = value_min {
-            sql2.push_str(&format!(" AND value >= ${pidx}::numeric"));
+            sql.push_str(&format!(" AND value >= ${pidx}::numeric"));
             pidx += 1;
             all_params.push(vmin.to_string());
         }
         if let Some(vmax) = value_max {
-            sql2.push_str(&format!(" AND value <= ${pidx}::numeric"));
+            sql.push_str(&format!(" AND value <= ${pidx}::numeric"));
             pidx += 1;
             all_params.push(vmax.to_string());
         }
 
-        sql2.push_str(&format!(" ORDER BY updated_at DESC LIMIT ${pidx}"));
+        sql.push_str(&format!(
+            " ORDER BY updated_at DESC LIMIT ${} OFFSET ${}",
+            pidx,
+            pidx + 1,
+        ));
         all_params.push(limit.to_string());
+        all_params.push(offset.to_string());
 
         #[derive(sqlx::FromRow, Serialize)]
         struct DealRow {
@@ -706,7 +836,7 @@ impl SearchMcpServer {
             updated_at: chrono::DateTime<chrono::Utc>,
         }
 
-        let mut q2 = sqlx::query_as::<_, DealRow>(&sql2);
+        let mut q2 = sqlx::query_as::<_, DealRow>(&sql);
         for p in &all_params {
             q2 = q2.bind(p);
         }
@@ -716,9 +846,17 @@ impl SearchMcpServer {
                 let search_term = query.as_deref().unwrap_or("*");
                 self.log_search(&format!("deals:{search_term}"), deals.len() as i32)
                     .await;
-                Self::json_result(&deals)
+                Self::json_result(&serde_json::json!({
+                    "results": deals,
+                    "count": deals.len(),
+                    "limit": limit,
+                    "offset": offset,
+                }))
             }
-            Err(e) => Self::error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to search deals");
+                Self::error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
@@ -731,7 +869,38 @@ impl SearchMcpServer {
         let status = Self::get_str(args, "status");
         let date_from = Self::get_str(args, "date_from");
         let date_to = Self::get_str(args, "date_to");
-        let limit = Self::get_i64(args, "limit").unwrap_or(20);
+        let limit = Self::clamp_limit(args, DEFAULT_LIMIT);
+        let offset = Self::clamp_offset(args);
+
+        // Validate query length if provided
+        if let Some(ref q) = query {
+            if let Err(msg) = Self::validate_query(q) {
+                return Self::error_result(&msg);
+            }
+        }
+
+        // Validate status enum
+        if let Some(ref s) = status {
+            let valid_statuses = ["sent", "delivered", "bounced", "failed", "pending"];
+            if !valid_statuses.contains(&s.as_str()) {
+                return Self::error_result(&format!(
+                    "Invalid status: '{s}'. Valid values: {}",
+                    valid_statuses.join(", ")
+                ));
+            }
+        }
+
+        // Validate date formats
+        if let Some(ref df) = date_from {
+            if let Err(msg) = Self::validate_date(df, "date_from") {
+                return Self::error_result(&msg);
+            }
+        }
+        if let Some(ref dt) = date_to {
+            if let Err(msg) = Self::validate_date(dt, "date_to") {
+                return Self::error_result(&msg);
+            }
+        }
 
         let mut sql = String::from(
             "SELECT id, recipient, subject, status, template, created_at \
@@ -766,7 +935,9 @@ impl SearchMcpServer {
         }
 
         sql.push_str(&format!(
-            " ORDER BY created_at DESC LIMIT ${param_idx}"
+            " ORDER BY created_at DESC LIMIT ${} OFFSET ${}",
+            param_idx,
+            param_idx + 1,
         ));
 
         #[derive(sqlx::FromRow, Serialize)]
@@ -784,15 +955,24 @@ impl SearchMcpServer {
             q = q.bind(p);
         }
         q = q.bind(limit);
+        q = q.bind(offset);
 
         match q.fetch_all(self.db.pool()).await {
             Ok(emails) => {
                 let search_term = query.as_deref().unwrap_or("*");
                 self.log_search(&format!("emails:{search_term}"), emails.len() as i32)
                     .await;
-                Self::json_result(&emails)
+                Self::json_result(&serde_json::json!({
+                    "results": emails,
+                    "count": emails.len(),
+                    "limit": limit,
+                    "offset": offset,
+                }))
             }
-            Err(e) => Self::error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to search emails");
+                Self::error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
@@ -801,8 +981,13 @@ impl SearchMcpServer {
             return Self::error_result("contacts.contact_interactions table does not exist");
         }
 
+        if let Err(msg) = Self::validate_query(query) {
+            return Self::error_result(&msg);
+        }
+
         let tags = Self::get_str_array(args, "tags");
-        let limit = Self::get_i64(args, "limit").unwrap_or(20);
+        let limit = Self::clamp_limit(args, DEFAULT_LIMIT);
+        let offset = Self::clamp_offset(args);
         let pattern = format!("%{query}%");
 
         let mut sql = String::from(
@@ -822,7 +1007,9 @@ impl SearchMcpServer {
         }
 
         sql.push_str(&format!(
-            " ORDER BY ci.created_at DESC LIMIT ${param_idx}"
+            " ORDER BY ci.created_at DESC LIMIT ${} OFFSET ${}",
+            param_idx,
+            param_idx + 1,
         ));
 
         #[derive(sqlx::FromRow, Serialize)]
@@ -844,18 +1031,27 @@ impl SearchMcpServer {
             q = q.bind(p);
         }
         q = q.bind(limit);
+        q = q.bind(offset);
 
         match q.fetch_all(self.db.pool()).await {
             Ok(notes) => {
                 self.log_search(&format!("notes:{query}"), notes.len() as i32)
                     .await;
-                Self::json_result(&notes)
+                Self::json_result(&serde_json::json!({
+                    "results": notes,
+                    "count": notes.len(),
+                    "limit": limit,
+                    "offset": offset,
+                }))
             }
-            Err(e) => Self::error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, query = query, "Failed to search notes");
+                Self::error_result(&format!("Database error: {e}"))
+            }
         }
     }
 
-    async fn handle_recent_activity(&self, limit: i64) -> CallToolResult {
+    async fn handle_recent_activity(&self, limit: i64, offset: i64) -> CallToolResult {
         let mut results: Vec<SearchResult> = Vec::new();
 
         // Recent contacts
@@ -869,7 +1065,7 @@ impl SearchMcpServer {
                 updated_at: chrono::DateTime<chrono::Utc>,
             }
 
-            if let Ok(rows) = sqlx::query_as::<_, Row>(
+            match sqlx::query_as::<_, Row>(
                 "SELECT id, first_name, last_name, company, updated_at \
                  FROM contacts.contacts ORDER BY updated_at DESC LIMIT $1",
             )
@@ -877,14 +1073,19 @@ impl SearchMcpServer {
             .fetch_all(self.db.pool())
             .await
             {
-                for r in rows {
-                    results.push(SearchResult {
-                        source: "contacts".into(),
-                        id: r.id,
-                        title: format!("{} {}", r.first_name, r.last_name),
-                        snippet: r.company.unwrap_or_default(),
-                        updated_at: r.updated_at,
-                    });
+                Ok(rows) => {
+                    for r in rows {
+                        results.push(SearchResult {
+                            source: "contacts".into(),
+                            id: r.id,
+                            title: format!("{} {}", r.first_name, r.last_name),
+                            snippet: r.company.unwrap_or_default(),
+                            updated_at: r.updated_at,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch recent contacts");
                 }
             }
         }
@@ -899,7 +1100,7 @@ impl SearchMcpServer {
                 updated_at: chrono::DateTime<chrono::Utc>,
             }
 
-            if let Ok(rows) = sqlx::query_as::<_, Row>(
+            match sqlx::query_as::<_, Row>(
                 "SELECT id, title, stage, updated_at \
                  FROM deals.deals ORDER BY updated_at DESC LIMIT $1",
             )
@@ -907,14 +1108,19 @@ impl SearchMcpServer {
             .fetch_all(self.db.pool())
             .await
             {
-                for r in rows {
-                    results.push(SearchResult {
-                        source: "deals".into(),
-                        id: r.id,
-                        title: r.title,
-                        snippet: r.stage.unwrap_or_default(),
-                        updated_at: r.updated_at,
-                    });
+                Ok(rows) => {
+                    for r in rows {
+                        results.push(SearchResult {
+                            source: "deals".into(),
+                            id: r.id,
+                            title: r.title,
+                            snippet: r.stage.unwrap_or_default(),
+                            updated_at: r.updated_at,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch recent deals");
                 }
             }
         }
@@ -929,7 +1135,7 @@ impl SearchMcpServer {
                 created_at: chrono::DateTime<chrono::Utc>,
             }
 
-            if let Ok(rows) = sqlx::query_as::<_, Row>(
+            match sqlx::query_as::<_, Row>(
                 "SELECT id, recipient, subject, created_at \
                  FROM email.emails ORDER BY created_at DESC LIMIT $1",
             )
@@ -937,14 +1143,19 @@ impl SearchMcpServer {
             .fetch_all(self.db.pool())
             .await
             {
-                for r in rows {
-                    results.push(SearchResult {
-                        source: "emails".into(),
-                        id: r.id,
-                        title: r.subject.unwrap_or_else(|| "(no subject)".into()),
-                        snippet: r.recipient,
-                        updated_at: r.created_at,
-                    });
+                Ok(rows) => {
+                    for r in rows {
+                        results.push(SearchResult {
+                            source: "emails".into(),
+                            id: r.id,
+                            title: r.subject.unwrap_or_else(|| "(no subject)".into()),
+                            snippet: r.recipient,
+                            updated_at: r.created_at,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch recent emails");
                 }
             }
         }
@@ -959,7 +1170,7 @@ impl SearchMcpServer {
                 created_at: chrono::DateTime<chrono::Utc>,
             }
 
-            if let Ok(rows) = sqlx::query_as::<_, Row>(
+            match sqlx::query_as::<_, Row>(
                 "SELECT id, subject, notes, created_at \
                  FROM contacts.contact_interactions ORDER BY created_at DESC LIMIT $1",
             )
@@ -967,30 +1178,45 @@ impl SearchMcpServer {
             .fetch_all(self.db.pool())
             .await
             {
-                for r in rows {
-                    let snippet = r
-                        .notes
-                        .as_deref()
-                        .unwrap_or("")
-                        .chars()
-                        .take(80)
-                        .collect::<String>();
-                    results.push(SearchResult {
-                        source: "notes".into(),
-                        id: r.id,
-                        title: r.subject.unwrap_or_else(|| "(untitled)".into()),
-                        snippet,
-                        updated_at: r.created_at,
-                    });
+                Ok(rows) => {
+                    for r in rows {
+                        let snippet = r
+                            .notes
+                            .as_deref()
+                            .unwrap_or("")
+                            .chars()
+                            .take(80)
+                            .collect::<String>();
+                        results.push(SearchResult {
+                            source: "notes".into(),
+                            id: r.id,
+                            title: r.subject.unwrap_or_else(|| "(untitled)".into()),
+                            snippet,
+                            updated_at: r.created_at,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to fetch recent notes");
                 }
             }
         }
 
         results.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
+        let total = results.len();
+
+        // Apply offset to combined results
+        let paginated: Vec<SearchResult> = results
+            .into_iter()
+            .skip(offset as usize)
+            .collect();
+
         Self::json_result(&serde_json::json!({
-            "total": results.len(),
-            "results": results
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "results": paginated
         }))
     }
 
@@ -1000,16 +1226,35 @@ impl SearchMcpServer {
             None => return Self::error_result("Missing required parameter: action"),
         };
 
+        // Validate action enum
+        let valid_actions = ["save", "list", "run", "delete"];
+        if !valid_actions.contains(&action.as_str()) {
+            return Self::error_result(&format!(
+                "Invalid action: '{action}'. Valid values: {}",
+                valid_actions.join(", ")
+            ));
+        }
+
         match action.as_str() {
             "save" => {
                 let name = match Self::get_str(args, "name") {
                     Some(n) => n,
-                    None => return Self::error_result("Missing required parameter: name"),
+                    None => return Self::error_result("Missing required parameter: name (required for 'save' action)"),
                 };
+                if name.len() > 100 {
+                    return Self::error_result("Name too long. Maximum is 100 characters");
+                }
                 let query_type = match Self::get_str(args, "query_type") {
                     Some(t) => t,
-                    None => return Self::error_result("Missing required parameter: query_type"),
+                    None => return Self::error_result("Missing required parameter: query_type (required for 'save' action)"),
                 };
+                let valid_types = ["all", "contacts", "deals", "emails", "notes"];
+                if !valid_types.contains(&query_type.as_str()) {
+                    return Self::error_result(&format!(
+                        "Invalid query_type: '{query_type}'. Valid values: {}",
+                        valid_types.join(", ")
+                    ));
+                }
                 let query_params = args
                     .get("query_params")
                     .cloned()
@@ -1030,29 +1275,46 @@ impl SearchMcpServer {
                 .await
                 {
                     Ok(saved) => {
-                        info!(name = name, "Saved search");
+                        info!(name = name, query_type = query_type, "Saved search created/updated");
                         Self::json_result(&saved)
                     }
-                    Err(e) => Self::error_result(&format!("Failed to save search: {e}")),
+                    Err(e) => {
+                        error!(error = %e, name = name, "Failed to save search");
+                        Self::error_result(&format!("Failed to save search: {e}"))
+                    }
                 }
             }
             "list" => {
+                let limit = Self::clamp_limit(args, DEFAULT_LIMIT);
+                let offset = Self::clamp_offset(args);
+
                 match sqlx::query_as::<_, SavedSearch>(
-                    "SELECT * FROM search.saved_searches ORDER BY created_at DESC",
+                    "SELECT * FROM search.saved_searches ORDER BY created_at DESC LIMIT $1 OFFSET $2",
                 )
+                .bind(limit)
+                .bind(offset)
                 .fetch_all(self.db.pool())
                 .await
                 {
-                    Ok(searches) => Self::json_result(&searches),
-                    Err(e) => Self::error_result(&format!("Database error: {e}")),
+                    Ok(searches) => Self::json_result(&serde_json::json!({
+                        "results": searches,
+                        "count": searches.len(),
+                        "limit": limit,
+                        "offset": offset,
+                    })),
+                    Err(e) => {
+                        error!(error = %e, "Failed to list saved searches");
+                        Self::error_result(&format!("Database error: {e}"))
+                    }
                 }
             }
             "run" => {
                 let name = match Self::get_str(args, "name") {
                     Some(n) => n,
-                    None => return Self::error_result("Missing required parameter: name"),
+                    None => return Self::error_result("Missing required parameter: name (required for 'run' action)"),
                 };
-                let limit = Self::get_i64(args, "limit").unwrap_or(20);
+                let limit = Self::clamp_limit(args, DEFAULT_LIMIT);
+                let offset = Self::clamp_offset(args);
 
                 let saved: Option<SavedSearch> = match sqlx::query_as(
                     "SELECT * FROM search.saved_searches WHERE name = $1",
@@ -1062,7 +1324,10 @@ impl SearchMcpServer {
                 .await
                 {
                     Ok(s) => s,
-                    Err(e) => return Self::error_result(&format!("Database error: {e}")),
+                    Err(e) => {
+                        error!(error = %e, name = name, "Failed to fetch saved search");
+                        return Self::error_result(&format!("Database error: {e}"));
+                    }
                 };
 
                 let saved = match saved {
@@ -1072,10 +1337,11 @@ impl SearchMcpServer {
                     }
                 };
 
-                // Merge the saved params with the limit override
+                // Merge the saved params with the limit/offset override
                 let mut params = saved.query_params.clone();
                 if let Some(obj) = params.as_object_mut() {
                     obj.insert("limit".to_string(), serde_json::json!(limit));
+                    obj.insert("offset".to_string(), serde_json::json!(offset));
                 }
 
                 // Route to appropriate handler
@@ -1085,7 +1351,7 @@ impl SearchMcpServer {
                             .get("query")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        self.handle_search_all(q, limit).await
+                        self.handle_search_all(q, limit, offset).await
                     }
                     "contacts" => self.handle_search_contacts(&params).await,
                     "deals" => self.handle_search_deals(&params).await,
@@ -1106,7 +1372,7 @@ impl SearchMcpServer {
             "delete" => {
                 let name = match Self::get_str(args, "name") {
                     Some(n) => n,
-                    None => return Self::error_result("Missing required parameter: name"),
+                    None => return Self::error_result("Missing required parameter: name (required for 'delete' action)"),
                 };
 
                 match sqlx::query("DELETE FROM search.saved_searches WHERE name = $1")
@@ -1116,44 +1382,61 @@ impl SearchMcpServer {
                 {
                     Ok(r) => {
                         if r.rows_affected() > 0 {
+                            info!(name = name, "Saved search deleted");
                             Self::json_result(&serde_json::json!({ "deleted": true, "name": name }))
                         } else {
                             Self::error_result(&format!("Saved search '{name}' not found"))
                         }
                     }
-                    Err(e) => Self::error_result(&format!("Failed to delete: {e}")),
+                    Err(e) => {
+                        error!(error = %e, name = name, "Failed to delete saved search");
+                        Self::error_result(&format!("Failed to delete: {e}"))
+                    }
                 }
             }
             _ => Self::error_result(&format!("Unknown action: {action}. Use save, list, run, or delete")),
         }
     }
 
-    async fn handle_search_stats(&self, limit: i64) -> CallToolResult {
+    async fn handle_search_stats(&self, limit: i64, offset: i64) -> CallToolResult {
         match sqlx::query_as::<_, SearchStat>(
             "SELECT query, COUNT(*) as search_count, MAX(searched_at) as last_searched \
              FROM search.search_log \
              GROUP BY query \
              ORDER BY search_count DESC \
-             LIMIT $1",
+             LIMIT $1 OFFSET $2",
         )
         .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
             Ok(stats) => {
-                let total_searches: (i64,) = sqlx::query_as(
+                let total_searches: (i64,) = match sqlx::query_as(
                     "SELECT COUNT(*) FROM search.search_log",
                 )
                 .fetch_one(self.db.pool())
                 .await
-                .unwrap_or((0,));
+                {
+                    Ok(row) => row,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to count total searches");
+                        (0,)
+                    }
+                };
 
                 Self::json_result(&serde_json::json!({
                     "total_searches": total_searches.0,
-                    "top_queries": stats
+                    "top_queries": stats,
+                    "count": stats.len(),
+                    "limit": limit,
+                    "offset": offset,
                 }))
             }
-            Err(e) => Self::error_result(&format!("Database error: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to fetch search stats");
+                Self::error_result(&format!("Database error: {e}"))
+            }
         }
     }
 }
@@ -1201,11 +1484,21 @@ impl ServerHandler for SearchMcpServer {
                 serde_json::to_value(&request.arguments).unwrap_or(serde_json::Value::Null);
             let name_str: &str = request.name.as_ref();
 
+            info!(tool = name_str, "Tool call received");
+
             let result = match name_str {
                 "search_all" => {
-                    let query = Self::get_str(&args, "query").unwrap_or_default();
-                    let limit = Self::get_i64(&args, "limit").unwrap_or(10);
-                    self.handle_search_all(&query, limit).await
+                    let query = match Self::get_str(&args, "query") {
+                        Some(q) => q,
+                        None => {
+                            return Ok(Self::error_result(
+                                "Missing required parameter: query",
+                            ))
+                        }
+                    };
+                    let limit = Self::clamp_limit(&args, DEFAULT_LIMIT);
+                    let offset = Self::clamp_offset(&args);
+                    self.handle_search_all(&query, limit, offset).await
                 }
                 "search_contacts" => self.handle_search_contacts(&args).await,
                 "search_deals" => self.handle_search_deals(&args).await,
@@ -1220,15 +1513,20 @@ impl ServerHandler for SearchMcpServer {
                     self.handle_search_notes(&query, &args).await
                 }
                 "recent_activity" => {
-                    let limit = Self::get_i64(&args, "limit").unwrap_or(5);
-                    self.handle_recent_activity(limit).await
+                    let limit = Self::clamp_limit(&args, DEFAULT_LIMIT);
+                    let offset = Self::clamp_offset(&args);
+                    self.handle_recent_activity(limit, offset).await
                 }
                 "saved_search" => self.handle_saved_search(&args).await,
                 "search_stats" => {
-                    let limit = Self::get_i64(&args, "limit").unwrap_or(20);
-                    self.handle_search_stats(limit).await
+                    let limit = Self::clamp_limit(&args, DEFAULT_LIMIT);
+                    let offset = Self::clamp_offset(&args);
+                    self.handle_search_stats(limit, offset).await
                 }
-                _ => Self::error_result(&format!("Unknown tool: {}", request.name)),
+                _ => {
+                    warn!(tool = name_str, "Unknown tool called");
+                    Self::error_result(&format!("Unknown tool: {}", request.name))
+                }
             };
 
             Ok(result)
