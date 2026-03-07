@@ -419,6 +419,8 @@ impl SearchMcpServer {
             return Self::error_result(&msg);
         }
 
+        // Each sub-source must fetch enough rows so the merged set can satisfy offset+limit
+        let fetch_limit = limit + offset;
         let pattern = format!("%{query}%");
         let mut results: Vec<SearchResult> = Vec::new();
 
@@ -441,7 +443,7 @@ impl SearchMcpServer {
                  ORDER BY updated_at DESC LIMIT $2",
             )
             .bind(&pattern)
-            .bind(limit)
+            .bind(fetch_limit)
             .fetch_all(self.db.pool())
             .await
             {
@@ -480,7 +482,7 @@ impl SearchMcpServer {
                  ORDER BY updated_at DESC LIMIT $2",
             )
             .bind(&pattern)
-            .bind(limit)
+            .bind(fetch_limit)
             .fetch_all(self.db.pool())
             .await
             {
@@ -525,7 +527,7 @@ impl SearchMcpServer {
                  ORDER BY created_at DESC LIMIT $2",
             )
             .bind(&pattern)
-            .bind(limit)
+            .bind(fetch_limit)
             .fetch_all(self.db.pool())
             .await
             {
@@ -563,7 +565,7 @@ impl SearchMcpServer {
                  ORDER BY created_at DESC LIMIT $2",
             )
             .bind(&pattern)
-            .bind(limit)
+            .bind(fetch_limit)
             .fetch_all(self.db.pool())
             .await
             {
@@ -596,10 +598,11 @@ impl SearchMcpServer {
 
         let total = results.len();
 
-        // Apply offset to combined results
+        // Apply offset and limit to combined results
         let paginated: Vec<SearchResult> = results
             .into_iter()
             .skip(offset as usize)
+            .take(limit as usize)
             .collect();
 
         self.log_search(query, total as i32).await;
@@ -630,6 +633,16 @@ impl SearchMcpServer {
         if let Some(ref q) = query {
             if let Err(msg) = Self::validate_query(q) {
                 return Self::error_result(&msg);
+            }
+        }
+
+        // Validate filter string lengths
+        if let Some(ref c) = company {
+            if c.len() > MAX_QUERY_LEN {
+                return Self::error_result(&format!(
+                    "Company filter too long ({} chars). Maximum is {MAX_QUERY_LEN} chars",
+                    c.len()
+                ));
             }
         }
 
@@ -778,6 +791,14 @@ impl SearchMcpServer {
         if let Some(vmin) = value_min {
             if vmin < 0.0 {
                 return Self::error_result("value_min cannot be negative");
+            }
+        }
+        if let Some(ref s) = stage {
+            if s.len() > MAX_QUERY_LEN {
+                return Self::error_result(&format!(
+                    "Stage filter too long ({} chars). Maximum is {MAX_QUERY_LEN} chars",
+                    s.len()
+                ));
             }
         }
 
@@ -934,7 +955,7 @@ impl SearchMcpServer {
         }
 
         sql.push_str(&format!(
-            " ORDER BY created_at DESC LIMIT ${} OFFSET ${}",
+            " ORDER BY created_at DESC LIMIT ${}::bigint OFFSET ${}::bigint",
             param_idx,
             param_idx + 1,
         ));
@@ -1006,7 +1027,7 @@ impl SearchMcpServer {
         }
 
         sql.push_str(&format!(
-            " ORDER BY ci.created_at DESC LIMIT ${} OFFSET ${}",
+            " ORDER BY ci.created_at DESC LIMIT ${}::bigint OFFSET ${}::bigint",
             param_idx,
             param_idx + 1,
         ));
@@ -1051,6 +1072,8 @@ impl SearchMcpServer {
     }
 
     async fn handle_recent_activity(&self, limit: i64, offset: i64) -> CallToolResult {
+        // Each sub-source must fetch enough rows so the merged set can satisfy offset+limit
+        let fetch_limit = limit + offset;
         let mut results: Vec<SearchResult> = Vec::new();
 
         // Recent contacts
@@ -1068,7 +1091,7 @@ impl SearchMcpServer {
                 "SELECT id, first_name, last_name, company, updated_at \
                  FROM contacts.contacts ORDER BY updated_at DESC LIMIT $1",
             )
-            .bind(limit)
+            .bind(fetch_limit)
             .fetch_all(self.db.pool())
             .await
             {
@@ -1103,7 +1126,7 @@ impl SearchMcpServer {
                 "SELECT id, company AS title, stage, updated_at \
                  FROM deals.deals ORDER BY updated_at DESC LIMIT $1",
             )
-            .bind(limit)
+            .bind(fetch_limit)
             .fetch_all(self.db.pool())
             .await
             {
@@ -1138,7 +1161,7 @@ impl SearchMcpServer {
                 "SELECT id, recipient, subject, created_at \
                  FROM email.emails ORDER BY created_at DESC LIMIT $1",
             )
-            .bind(limit)
+            .bind(fetch_limit)
             .fetch_all(self.db.pool())
             .await
             {
@@ -1173,7 +1196,7 @@ impl SearchMcpServer {
                 "SELECT id, subject, notes, created_at \
                  FROM contacts.contact_interactions ORDER BY created_at DESC LIMIT $1",
             )
-            .bind(limit)
+            .bind(fetch_limit)
             .fetch_all(self.db.pool())
             .await
             {
@@ -1205,10 +1228,11 @@ impl SearchMcpServer {
 
         let total = results.len();
 
-        // Apply offset to combined results
+        // Apply offset and limit to combined results
         let paginated: Vec<SearchResult> = results
             .into_iter()
             .skip(offset as usize)
+            .take(limit as usize)
             .collect();
 
         Self::json_result(&serde_json::json!({
@@ -1258,6 +1282,9 @@ impl SearchMcpServer {
                     .get("query_params")
                     .cloned()
                     .unwrap_or(serde_json::json!({}));
+                if !query_params.is_object() {
+                    return Self::error_result("query_params must be a JSON object");
+                }
 
                 let id = uuid::Uuid::new_v4().to_string();
                 match sqlx::query_as::<_, SavedSearch>(
