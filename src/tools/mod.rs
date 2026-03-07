@@ -474,9 +474,9 @@ impl SearchMcpServer {
             }
 
             match sqlx::query_as::<_, Row>(
-                "SELECT id, title, stage, value::float8 as value, updated_at \
+                "SELECT id, company AS title, stage, value::float8 as value, updated_at \
                  FROM deals.deals \
-                 WHERE title ILIKE $1 OR company ILIKE $1 \
+                 WHERE company ILIKE $1 \
                  ORDER BY updated_at DESC LIMIT $2",
             )
             .bind(&pattern)
@@ -689,7 +689,7 @@ impl SearchMcpServer {
         }
 
         sql.push_str(&format!(
-            " ORDER BY updated_at DESC LIMIT ${} OFFSET ${}",
+            " ORDER BY updated_at DESC LIMIT ${}::bigint OFFSET ${}::bigint",
             param_idx,
             param_idx + 1,
         ));
@@ -782,8 +782,8 @@ impl SearchMcpServer {
         }
 
         let mut sql = String::from(
-            "SELECT id, title, company, stage, value::float8 as value, \
-             contact_id, notes, status, created_at, updated_at \
+            "SELECT id, company AS title, stage, value::float8 as value, \
+             contact_name, contact_email, description, created_at, updated_at \
              FROM deals.deals WHERE 1=1",
         );
         let mut all_params: Vec<String> = Vec::new();
@@ -792,7 +792,7 @@ impl SearchMcpServer {
         if let Some(ref q) = query {
             let p = format!("%{q}%");
             sql.push_str(&format!(
-                " AND (title ILIKE ${pi} OR company ILIKE ${pi})",
+                " AND company ILIKE ${pi}",
                 pi = pidx
             ));
             pidx += 1;
@@ -815,7 +815,7 @@ impl SearchMcpServer {
         }
 
         sql.push_str(&format!(
-            " ORDER BY updated_at DESC LIMIT ${} OFFSET ${}",
+            " ORDER BY updated_at DESC LIMIT ${}::bigint OFFSET ${}::bigint",
             pidx,
             pidx + 1,
         ));
@@ -826,12 +826,11 @@ impl SearchMcpServer {
         struct DealRow {
             id: String,
             title: String,
-            company: Option<String>,
             stage: Option<String>,
             value: Option<f64>,
-            contact_id: Option<String>,
-            notes: Option<String>,
-            status: Option<String>,
+            contact_name: Option<String>,
+            contact_email: Option<String>,
+            description: Option<String>,
             created_at: chrono::DateTime<chrono::Utc>,
             updated_at: chrono::DateTime<chrono::Utc>,
         }
@@ -1101,7 +1100,7 @@ impl SearchMcpServer {
             }
 
             match sqlx::query_as::<_, Row>(
-                "SELECT id, title, stage, updated_at \
+                "SELECT id, company AS title, stage, updated_at \
                  FROM deals.deals ORDER BY updated_at DESC LIMIT $1",
             )
             .bind(limit)
